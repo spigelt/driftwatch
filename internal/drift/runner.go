@@ -3,51 +3,52 @@ package drift
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/yourorg/driftwatch/internal/compose"
 	"github.com/yourorg/driftwatch/internal/docker"
 )
 
-// Runner orchestrates a single drift-check cycle.
+// runFn abstracts the core run logic for testability.
+type runFn func(ctx context.Context) ([]Report, error)
+
+// Runner ties together compose parsing, docker inspection, and drift comparison.
 type Runner struct {
-	client     *docker.Client
-	composePath string
+	client      *docker.Client
+	composeFile string
+	// run is the internal implementation; swapped in tests via stubRunner.
+	run runFn
 }
 
-// NewRunner creates a Runner for the given compose file path.
-func NewRunner(client *docker.Client, composePath string) *Runner {
-	return &Runner{client: client, composePath: composePath}
+// NewRunner constructs a Runner for the given compose file.
+func NewRunner(client *docker.Client, composeFile string) *Runner {
+	r := &Runner{
+		client:      client,
+		composeFile: composeFile,
+	}
+	r.run = r.runImpl
+	return r
 }
 
-// Run executes a full drift check and returns a populated Report.
-func (r *Runner) Run(ctx context.Context) (*Report, error) {
-	svcs, err := compose.ParseFile(r.composePath)
+// Run executes a single drift-check cycle and returns one Report per service.
+func (r *Runner) Run(ctx context.Context) ([]Report, error) {
+	return r.run(ctx)
+}
+
+func (r *Runner) runImpl(ctx context.Context) ([]Report, error) {
+	project, err := compose.ParseFile(r.composeFile)
 	if err != nil {
 		return nil, fmt.Errorf("parse compose: %w", err)
 	}
-	compose.NormaliseAll(svcs)
+	compose.NormaliseAll(project)
 
-	report := &Report{Timestamp: time.Now()}
-
-	for name, svc := range svcs {
+	var reports []Report
+	for name, svc := range project.Services {
 		info, err := r.client.Inspect(ctx, name)
 		if err != nil {
-			// Container not running — treat as full drift on image field.
-			report.Results = append(report.Results, Result{
-				Service: name,
-				Drifts: []Drift{{Field: "running", Expected: "true", Actual: "false"}},
-			})
-			continue
+			return nil, fmt.Errorf("inspect %s: %w", name, err)
 		}
 		docker.NormaliseInfo(info)
-
-		drifts := Compare(svc, info)
-		report.Results = append(report.Results, Result{
-			Service: name,
-			Drifts:  drifts,
-		})
+		reports = append(reports, Compare(name, svc, *info))
 	}
-
-	return report, nil
+	return reports, nil
 }
